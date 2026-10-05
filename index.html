@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Campus Shuttle – Student App</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.263.0/dist/umd/lucide.min.js"></script>
+<style>
+/* ---------- Theme tokens ---------- */
+:root {
+  --bg: #e8ecf4;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #0f172a; }
+}
+:root[data-theme="dark"] { --bg: #0f172a; }
+
+/* ---------- Base ---------- */
+html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+body { height: 100%; margin: 0; background: var(--bg); font-family: 'Inter', system-ui, sans-serif; }
+#root { height: 100%; }
+
+/* ---------- Phone frame ---------- */
+.phone { height: min(800px, 100%); }
+
+/* ---------- Animations ---------- */
+@keyframes pulse-ring { 0% { r: 6; opacity: .6; } 100% { r: 18; opacity: 0; } }
+.pulse { animation: pulse-ring 1.8s infinite; }
+
+@keyframes slide-up { from { transform: translateY(100%); } to { transform: none; } }
+.sheet { animation: slide-up .28s ease-out; }
+
+@keyframes scan-move { from { top: 14%; } to { top: 84%; } }
+.scan-line { animation: scan-move 1.2s ease-in-out infinite alternate; }
+
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+/* Static data + helpers (no UI here) */
+const ROUTES = {
+  A: { name: "Route A", label: "Main Gate ↔ Library",  color: "#2563eb", bus: "SH-101", tag: "Peak",              speed: .00006,
+       pts: [[20,210],[80,180],[140,150],[200,110],[270,70],[340,50]] },
+  B: { name: "Route B", label: "Hostels ↔ Faculty",    color: "#e11d48", bus: "SH-204", tag: "Peak",              speed: .00005,
+       pts: [[20,60],[90,90],[150,140],[220,190],[290,200],[340,225]] },
+  C: { name: "Route C", label: "Sports Complex Loop",  color: "#059669", bus: "SH-307", tag: "Off-peak · 2× pts", speed: .00004,
+       pts: [[50,235],[110,205],[190,175],[250,125],[300,125],[345,150]] },
+};
+const INITIAL_SEATS = { A: 0, B: 17, C: 9 };    // free seats out of 30 (Route A starts full)
+const REDEEM_COST = 400;
+const OFF_PEAK_BONUS = 50;
+
+/* Point at fraction t (0..1) along a polyline */
+function pointAlong(pts, t) {
+  const seg = []; let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1]);
+    seg.push(d); total += d;
+  }
+  let dist = t * total;
+  for (let i = 0; i < seg.length; i++) {
+    if (dist <= seg[i]) {
+      const k = dist / seg[i];
+      return [pts[i][0] + (pts[i+1][0] - pts[i][0]) * k, pts[i][1] + (pts[i+1][1] - pts[i][1]) * k];
+    }
+    dist -= seg[i];
+  }
+  return pts[pts.length - 1];
+}
+
+/* Bus progress along its route, driven by the timetable so the map and the ETA always agree:
+   the bus reaches the student's stop exactly at the scheduled departure time. */
+function busProgress(routeKey, busIndex, simMin) {
+  const left = nextDeparture(routeKey, simMin) - simMin;
+  return (((ROUTES[routeKey].stopT - left / PERIOD + busIndex * .5) % 1) + 1) % 1;
+}
+
+/* ---------- Simulated clock + cancellation policy ---------- */
+const SIM_MS = 8000;           // 1 simulated minute = 8 real seconds
+const BASE_MIN = 8 * 60 + 20;  // simulated clock starts at 08:20
+const BOOK_CUTOFF = 5;         // policy: reserve at least 5 min before departure
+const PERIOD = 15;             // each route departs every 15 min
+const OFFSETS = { A: 0, B: 3, C: 12 };   // minute-of-quarter-hour of each route's departures
+const CANCEL_CUTOFF = 5;       // policy: cancel until 5 min before departure
+
+function fmtTime(m) {
+  const t = BASE_MIN + Math.floor(m);
+  return String(Math.floor(t / 60) % 24).padStart(2, "0") + ":" + String(t % 60).padStart(2, "0");
+}
+function cancelInfo(b, simMin) {
+  const left = b.departAt - simMin;
+  return { allowed: left >= CANCEL_CUTOFF, minsLeft: Math.max(0, Math.ceil(left)), deadline: fmtTime(b.departAt - CANCEL_CUTOFF) };
+}
+
+/* Bus arrival state from ETA (minutes) */
+function etaState(e) {
+  if (e >= 6) return { label: "On the way",  cls: "bg-blue-100 text-blue-700" };
+  if (e >= 2) return { label: "Approaching", cls: "bg-amber-100 text-amber-700" };
+  if (e === 1) return { label: "Arriving",   cls: "bg-orange-100 text-orange-700" };
+  return { label: "At stop", cls: "bg-emerald-100 text-emerald-700" };
+}
+
+/* Next scheduled departure (simulated minutes) and whether booking is still open */
+function nextDeparture(k, simMin) {
+  const abs = BASE_MIN + simMin, o = OFFSETS[k];
+  return Math.ceil((abs - o) / PERIOD) * PERIOD + o - BASE_MIN;
+}
+function bookingInfo(k, simMin) {
+  const dep = nextDeparture(k, simMin), left = dep - simMin;
+  return { dep, left, open: left >= BOOK_CUTOFF, minsLeft: Math.max(0, Math.ceil(left)), closesAt: fmtTime(dep - BOOK_CUTOFF), following: fmtTime(dep + PERIOD) };
+}
+
+/* Where each route passes the student's location on the map (fraction along the route) */
+const USER_POS = [150, 150];
+Object.values(ROUTES).forEach(r => {
+  let best = 0, bd = 1e9;
+  for (let i = 0; i <= 400; i++) {
+    const p = pointAlong(r.pts, i / 400), dist = Math.hypot(p[0] - USER_POS[0], p[1] - USER_POS[1]);
+    if (dist < bd) { bd = dist; best = i / 400; }
+  }
+  r.stopT = best;
+});
+
+
+/* Shared UI primitives */
+const { useState, useEffect, useRef } = React;
+const html = htm.bind(React.createElement);
+
+/* Lucide icon wrapper */
+function Icon({ n, s = 18, c = "" }) {
+  const ref = useRef();
+  useEffect(() => {
+    if (window.lucide && ref.current) {
+      ref.current.innerHTML = `<i data-lucide="${n}"></i>`;
+      lucide.createIcons({ attrs: { width: s, height: s } });
+    }
+  }, [n, s]);
+  return html`<span ref=${ref} className=${"inline-flex items-center " + c}></span>`;
+}
+
+/* Centered modal over the phone screen */
+function Modal({ children, onClose }) {
+  return html`
+    <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-900/60 p-6" onClick=${onClose}>
+      <div className="bg-white rounded-3xl p-6 w-full text-center shadow-2xl" onClick=${e => e.stopPropagation()}>${children}</div>
+    </div>`;
+}
+
+/* Short validator "beep" (silently ignored if audio is blocked) */
+function beep() {
+  try {
+    const C = window.AudioContext || window.webkitAudioContext, c = new C(), o = c.createOscillator(), g = c.createGain();
+    o.frequency.value = 1000; g.gain.value = .15; o.connect(g); g.connect(c.destination); o.start();
+    setTimeout(() => { o.stop(); c.close(); }, 180);
+  } catch (e) {}
+}
+
+/* Phone-sized frame shared by every screen */
+function PhoneFrame({ children }) {
+  return html`
+    <div className="h-full flex items-center justify-center p-2">
+      <div className="phone relative w-full max-w-[400px] bg-slate-50 rounded-[2.5rem] shadow-2xl overflow-hidden border-[8px] border-slate-900 flex flex-col">${children}</div>
+    </div>`;
+}
+
+
+/* Feature sections: map, payment, rewards, reservation sheet */
+
+/* 1. Live bus tracking */
+function MapCard({ sel, setSel, simMin, eta, seats }) {
+  const R = ROUTES[sel], st = etaState(eta);
+  return html`
+  <div className="relative bg-white px-3 pb-3">
+    <div className="flex gap-2 pb-2 overflow-x-auto">
+      ${Object.entries(ROUTES).map(([k, r]) => html`
+        <button key=${k} onClick=${() => setSel(k)}
+          className=${"shrink-0 px-3 py-1.5 rounded-full text-xs font-semibold border transition " + (sel === k ? "text-white border-transparent" : "bg-white text-slate-600 border-slate-200")}
+          style=${sel === k ? { background: r.color } : {}}>${r.name}</button>`)}
+    </div>
+    <div className="rounded-2xl overflow-hidden border border-slate-200 bg-[#eef3ea]">
+      <svg viewBox="0 0 360 260" className="w-full block">
+        <defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M30 0H0V30" fill="none" stroke="#dfe7da" strokeWidth="1"/></pattern></defs>
+        <rect width="360" height="260" fill="url(#grid)"/>
+        <rect x="130" y="20" width="60" height="38" rx="6" fill="#d7e3cf"/>
+        <rect x="250" y="160" width="70" height="40" rx="6" fill="#d7e3cf"/>
+        <rect x="30" y="100" width="50" height="34" rx="6" fill="#d7e3cf"/>
+        ${Object.entries(ROUTES).map(([k, r]) => html`
+          <polyline key=${k} points=${r.pts.map(p => p.join(",")).join(" ")} fill="none" stroke=${r.color}
+            strokeWidth=${sel === k ? 5 : 3} strokeLinecap="round" strokeLinejoin="round"
+            opacity=${sel === k ? 1 : .3} strokeDasharray=${sel === k ? "" : "2 6"}/>`)}
+        ${Object.entries(ROUTES).map(([k, r]) => [0, 1].map(i => {
+          const [x, y] = pointAlong(r.pts, busProgress(k, i, simMin));
+          return html`
+            <g key=${k + i} transform=${`translate(${x},${y})`} opacity=${sel === k ? 1 : .5}>
+              <circle r="11" fill="white" stroke=${r.color} strokeWidth="3"/>
+              <text textAnchor="middle" y="4" fontSize="10" fontWeight="700" fill=${r.color}>${k}</text>
+            </g>`;
+        }))}
+        <circle cx="150" cy="150" r="6" fill="#2563eb" opacity=".5" className="pulse"/>
+        <circle cx="150" cy="150" r="7" fill="#2563eb" stroke="white" strokeWidth="3"/>
+        <text x="162" y="143" fontSize="10" fontWeight="600" fill="#1e3a8a">You</text>
+      </svg>
+    </div>
+    <div className="flex items-center justify-between mt-3 px-1 gap-2">
+      <div>
+        <p className="text-sm font-semibold text-slate-900">${R.name} · ${R.label}</p>
+        <p className="text-xs text-slate-500 flex items-center gap-1.5 flex-wrap mt-0.5">
+          <${Icon} n="clock" s=${12}/> ${eta === 0 ? "Bus at stop" : `Next bus in ${eta} min`} · ${R.bus}
+          <span className=${"text-[10px] font-bold px-1.5 py-0.5 rounded-full " + st.cls}>${st.label}</span>
+        </p>
+      </div>
+      <span className=${"shrink-0 text-[11px] font-semibold px-2 py-1 rounded-full " + (seats[sel] === 0 ? "bg-rose-100 text-rose-700" : sel === "C" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600")}>${seats[sel] === 0 ? "Full" : R.tag}</span>
+    </div>
+  </div>`;
+}
+
+/* 3. Payment method toggle */
+const PAY_OPTIONS = [
+  ["card", "Student ID Card", "Visa / Touch 'n Go",       "contact"],
+  ["qr",   "New Student",     "MAE / Touch 'n Go QR Payment", "scan-line"],
+];
+function PaymentCard({ pay, setPay, openScan, paid }) {
+  return html`
+  <div className="m-4 mb-3 bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
+    <div className="flex items-center gap-2 mb-3"><${Icon} n="credit-card" s=${18} c="text-slate-700"/><h2 className="font-semibold text-slate-900 text-sm">Payment method</h2></div>
+    ${PAY_OPTIONS.map(([k, title, sub, icon]) => html`
+      <button key=${k} onClick=${() => { setPay(k); if (k === "qr") openScan(); }}
+        className=${"w-full flex items-center gap-3 p-3 mb-2 last:mb-0 rounded-xl border-2 text-left transition " + (pay === k ? "border-blue-600 bg-blue-50" : "border-slate-200")}>
+        <span className=${"w-9 h-9 rounded-lg flex items-center justify-center " + (pay === k ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-500")}><${Icon} n=${icon} s=${18}/></span>
+        <span className="flex-1"><span className="block text-sm font-semibold text-slate-900">${title}</span><span className="block text-xs text-slate-500">${sub}</span></span>
+        <span className=${"w-5 h-5 rounded-full border-2 flex items-center justify-center " + (pay === k ? "border-blue-600" : "border-slate-300")}>${pay === k && html`<span className="w-2.5 h-2.5 rounded-full bg-blue-600"></span>`}</span>
+      </button>`)}
+    ${paid
+      ? html`<p className="mt-2 text-xs bg-emerald-50 text-emerald-700 rounded-lg px-3 py-2 flex items-center gap-1.5"><${Icon} n="check-circle-2" s=${14}/> Ride paid · reward redemption unlocked</p>`
+      : html`<button onClick=${openScan} className="mt-2 w-full bg-blue-600 text-white text-sm font-semibold rounded-xl py-2.5 flex items-center justify-center gap-2"><${Icon} n=${pay === "qr" ? "scan-line" : "contact"} s=${16}/> ${pay === "qr" ? "Scan Bus QR" : "Tap Student ID Card to pay"}</button>`}
+  </div>`;
+}
+
+/* 4. Gamified rewards */
+function RewardsCard({ points, redeem, paid }) {
+  const pct = Math.min(100, points / REDEEM_COST * 100);
+  const enough = points >= REDEEM_COST, canRedeem = enough && paid;
+  const hint = !enough ? `${REDEEM_COST - points} pts to a free drink · Ride Route C off-peak for 2× points`
+    : !paid ? "Enough points! Pay for your ride to unlock redemption."
+    : "You can redeem a free drink!";
+  return html`
+  <div className="mx-4 mb-4 rounded-2xl p-4 text-white shadow-md bg-gradient-to-br from-amber-500 to-orange-600">
+    <div className="flex items-center justify-between">
+      <div><p className="text-xs opacity-90">Off-peak Rewards</p><p className="text-3xl font-extrabold">${points} <span className="text-sm font-semibold opacity-90">pts</span></p></div>
+      <${Icon} n="gift" s=${34} c="opacity-90"/>
+    </div>
+    <div className="mt-3 h-2 rounded-full bg-white/30 overflow-hidden"><div className="h-full bg-white rounded-full transition-all" style=${{ width: pct + "%" }}></div></div>
+    <p className="text-xs mt-1.5 opacity-90">${hint}</p>
+    <button onClick=${redeem} disabled=${!canRedeem} className="mt-3 w-full bg-white text-orange-600 font-bold text-sm rounded-xl py-2.5 flex items-center justify-center gap-2 disabled:opacity-60">
+      <${Icon} n=${canRedeem ? "coffee" : "lock"} s=${16}/> Redeem at Campus Cafe · ${REDEEM_COST} pts
+    </button>
+  </div>`;
+}
+
+/* Demo helper: jump the simulated clock forward (works before AND after booking) */
+function FastForward({ ff, simMin }) {
+  return html`<button type="button" onClick=${ff} className="mt-3 w-full flex items-center justify-center gap-1.5 text-xs font-semibold text-slate-600 bg-slate-100 rounded-xl py-2">
+    <${Icon} n="fast-forward" s=${14}/> Demo: fast-forward 2 min <span className="text-slate-400 font-normal">· now ${fmtTime(simMin)}</span></button>`;
+}
+
+/* Cancellation policy banner (green = allowed, red = closed) */
+function PolicyNote({ booking, simMin }) {
+  const c = cancelInfo(booking, simMin);
+  return c.allowed
+    ? html`<p className="text-xs bg-emerald-50 text-emerald-700 rounded-lg px-3 py-2 flex items-start gap-1.5 text-left"><${Icon} n="shield-check" s=${14} c="shrink-0 mt-0.5"/><span>Cancellation available until ${c.deadline} (5 min before departure).</span></p>`
+    : html`<p className="text-xs bg-rose-50 text-rose-700 rounded-lg px-3 py-2 flex items-start gap-1.5 text-left"><${Icon} n="ban" s=${14} c="shrink-0 mt-0.5"/><span>Cancellation closed: departure is in ${c.minsLeft} min. Trips must be cancelled at least 5 min before departure.</span></p>`;
+}
+function CancelButton({ booking, simMin, onClick }) {
+  const ok = cancelInfo(booking, simMin).allowed;
+  return html`<button onClick=${onClick} disabled=${!ok} className="flex-1 py-3 rounded-xl border border-rose-200 text-rose-600 font-semibold text-sm disabled:opacity-40">Cancel Trip</button>`;
+}
+
+/* 2. Seat reservation bottom sheet (+ confirmation state) */
+function ReserveSheet({ sel, setSel, seats, eta, booking, pay, paid, simMin, reserve, askCancel, ff, openScan, close }) {
+  const R = ROUTES[sel], bi = bookingInfo(sel, simMin), full = seats[sel] < 1;
+  const payText = pay === "qr" ? "Scan the bus QR (MAE / Touch 'n Go)" : "Pay when boarding with Student ID Card";
+  return html`
+  <div className="absolute inset-0 z-20 bg-slate-900/40 flex items-end" onClick=${close}>
+    <div className="sheet bg-white w-full rounded-t-3xl p-5 pb-6 max-h-full overflow-y-auto" onClick=${e => e.stopPropagation()}>
+      <div className="w-10 h-1 bg-slate-300 rounded-full mx-auto mb-4"></div>
+      ${booking ? html`
+        <div className="text-center">
+          <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-600 mx-auto flex items-center justify-center mb-3"><${Icon} n="check-circle-2" s=${30}/></div>
+          <h3 className="text-xl font-bold text-slate-900">Seat Reserved Successfully</h3>
+          <p className="text-sm text-slate-500 mb-4">${ROUTES[booking.route].name} — ${ROUTES[booking.route].label}</p>
+          <div className="bg-slate-50 rounded-xl p-3 text-sm mb-3 space-y-2">
+            ${[["Bus", booking.bus], ["Seat", "#" + booking.seat], ["Arrival", booking.eta + " min"], ["Departure", fmtTime(booking.departAt)], ["Payment", payText]].map(([a, b]) => html`
+              <div key=${a} className="flex justify-between gap-4"><span className="text-slate-500">${a}</span><span className="font-semibold text-slate-900 text-right">${b}</span></div>`)}
+          </div>
+          <div className="mb-3"><${PolicyNote} booking=${booking} simMin=${simMin}/></div>
+          ${paid
+            ? html`<p className="w-full mb-3 py-3 rounded-xl bg-emerald-50 text-emerald-700 font-semibold text-sm flex items-center justify-center gap-2"><${Icon} n="check-circle-2" s=${16}/> Payment completed</p>`
+            : html`<button onClick=${openScan} className="w-full mb-3 py-3 rounded-xl bg-blue-600 text-white font-semibold text-sm flex items-center justify-center gap-2"><${Icon} n=${pay === "qr" ? "scan-line" : "contact"} s=${16}/> ${pay === "qr" ? "Scan Bus QR to pay" : "Tap Student ID Card to pay"}</button>`}
+          <div className="flex gap-2">
+            <${CancelButton} booking=${booking} simMin=${simMin} onClick=${askCancel}/>
+            <button onClick=${close} className="flex-1 py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm">Done</button>
+          </div>
+          <${FastForward} ff=${ff} simMin=${simMin}/>
+        </div>` : html`
+        <h3 className="text-lg font-bold text-slate-900 mb-3">Reserve a seat</h3>
+        <div className="grid grid-cols-3 gap-2 mb-4">
+          ${Object.entries(ROUTES).map(([k, r]) => html`
+            <button key=${k} onClick=${() => setSel(k)} className=${"rounded-xl p-2.5 border-2 text-left transition " + (sel === k ? "bg-slate-50" : "border-slate-200")} style=${sel === k ? { borderColor: r.color } : {}}>
+              <span className="block text-xs font-bold" style=${{ color: r.color }}>${r.name}</span>
+              <span className=${"block text-sm font-bold " + (seats[k] === 0 ? "text-rose-600" : "text-slate-900")}>${seats[k] === 0 ? "Full" : seats[k] + "/30"}</span>
+              <span className="block text-[10px] text-slate-500">${seats[k] === 0 ? "no seats left" : "seats free"}</span>
+            </button>`)}
+        </div>
+        <div className="mb-4">
+          <div className="flex justify-between text-xs text-slate-500 mb-1"><span>${R.bus} · ${eta === 0 ? "at stop" : "arrives in " + eta + " min"}</span><span className="font-semibold text-slate-800">${seats[sel]} of 30 available</span></div>
+          <div className="h-2 rounded-full bg-slate-100 overflow-hidden"><div className="h-full rounded-full" style=${{ width: seats[sel] / 30 * 100 + "%", background: R.color }}></div></div>
+        </div>
+        ${sel === "C" && html`<p className="text-xs bg-emerald-50 text-emerald-700 rounded-lg px-3 py-2 mb-3 flex items-center gap-1.5"><${Icon} n="sparkles" s=${14}/> Off-peak ride: earn +${OFF_PEAK_BONUS} reward points</p>`}
+        ${full
+          ? html`<p className="text-xs bg-amber-50 text-amber-700 rounded-lg px-3 py-2 mb-3 flex items-start gap-1.5"><${Icon} n="users" s=${14} c="shrink-0 mt-0.5"/><span>${R.name} is full (0/30). Please choose another route.</span></p>`
+          : bi.open
+          ? html`<p className="text-xs bg-slate-50 text-slate-600 rounded-lg px-3 py-2 mb-3 flex items-start gap-1.5"><${Icon} n="clock" s=${14} c="shrink-0 mt-0.5"/><span>Bus arrives in ${bi.minsLeft} min and departs ${fmtTime(bi.dep)}. Booking closes at ${bi.closesAt}.</span></p>`
+          : html`<p className="text-xs bg-rose-50 text-rose-700 rounded-lg px-3 py-2 mb-3 flex items-start gap-1.5"><${Icon} n="ban" s=${14} c="shrink-0 mt-0.5"/><span>Booking closed: the ${fmtTime(bi.dep)} bus arrives in ${bi.minsLeft} min. Seats must be reserved at least 5 min before departure. Booking reopens at ${fmtTime(bi.dep)} for the ${bi.following} bus.</span></p>`}
+        <button onClick=${reserve} disabled=${full || !bi.open} className="w-full py-3.5 rounded-2xl text-white font-semibold disabled:opacity-50" style=${{ background: R.color }}>${full ? R.name + " is full" : bi.open ? "Reserve seat on " + R.name : "Booking closed for " + fmtTime(bi.dep)}</button>
+        <p className="text-[11px] text-slate-400 text-center mt-2">Reserve at least 5 min before departure · Cancel until 5 min before departure.</p>
+        <${FastForward} ff=${ff} simMin=${simMin}/>`}
+    </div>
+  </div>`;
+}
+
+/* My Trips: upcoming + previous bookings */
+const STATUS_CLS = { Reserved: "bg-blue-100 text-blue-700", Completed: "bg-slate-100 text-slate-600", Cancelled: "bg-rose-100 text-rose-700" };
+function TripsSheet({ booking, history, simMin, askCancel, ff, close }) {
+  return html`
+  <div className="absolute inset-0 z-20 bg-slate-900/40 flex items-end" onClick=${close}>
+    <div className="sheet bg-white w-full rounded-t-3xl p-5 pb-6 max-h-full overflow-y-auto" onClick=${e => e.stopPropagation()}>
+      <div className="w-10 h-1 bg-slate-300 rounded-full mx-auto mb-4"></div>
+      <h3 className="text-lg font-bold text-slate-900 mb-3">My Trips</h3>
+      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Upcoming</p>
+      ${booking ? html`
+        <div className="border border-slate-200 rounded-xl p-3 mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <div><p className="text-sm font-semibold text-slate-900">${ROUTES[booking.route].name} — ${booking.bus}</p><p className="text-xs text-slate-500">Today ${fmtTime(booking.departAt)} · Seat #${booking.seat}</p></div>
+            <span className=${"text-[11px] font-semibold px-2 py-1 rounded-full " + STATUS_CLS.Reserved}>Reserved</span>
+          </div>
+          <div className="mb-2"><${PolicyNote} booking=${booking} simMin=${simMin}/></div>
+          <div className="flex"><${CancelButton} booking=${booking} simMin=${simMin} onClick=${askCancel}/></div>
+          <${FastForward} ff=${ff} simMin=${simMin}/>
+        </div>` : html`<p className="text-sm text-slate-400 mb-4">No upcoming trips.</p>`}
+      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Previous</p>
+      ${history.map((h, i) => html`
+        <div key=${i} className="flex items-center justify-between py-2.5 border-b border-slate-100 last:border-0">
+          <div><p className="text-sm font-semibold text-slate-900">${ROUTES[h.route].name} — ${h.bus}</p><p className="text-xs text-slate-500">${h.when}</p></div>
+          <span className=${"text-[11px] font-semibold px-2 py-1 rounded-full " + STATUS_CLS[h.status]}>${h.status}</span>
+        </div>`)}
+      <button onClick=${close} className="mt-4 w-full py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm">Close</button>
+    </div>
+  </div>`;
+}
+
+/* Simulated payment: new students scan the bus QR, others tap their Student ID Card */
+function ScanModal({ bus, mode, onPaid, onClose }) {
+  const [phase, setPhase] = useState("idle");   // idle -> scanning -> done
+  const qr = mode === "qr";
+  useEffect(() => {
+    if (phase !== "scanning") return;
+    const t = setTimeout(() => { setPhase("done"); beep(); onPaid(); }, 1100);
+    return () => clearTimeout(t);
+  }, [phase]);
+  return html`
+  <${Modal} onClose=${onClose}>
+    ${phase === "done" ? html`
+      <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 mx-auto flex items-center justify-center mb-3"><${Icon} n="check-circle-2" s=${36}/></div>
+      <h3 className="font-bold text-slate-900 text-xl">Payment Successful</h3>
+      <p className="text-sm text-slate-500 mt-1">Bus ${bus}</p>
+      <p className="text-sm text-emerald-600 font-semibold mb-3">Payment confirmed</p>
+      <div className="inline-block font-mono font-extrabold tracking-[.3em] bg-emerald-600 text-white px-5 py-1.5 rounded-full">BEEP</div>
+      <p className="text-xs text-amber-600 font-semibold mt-3 flex items-center justify-center gap-1"><${Icon} n="gift" s=${14}/> Reward redemption unlocked</p>
+      <button onClick=${onClose} className="mt-4 w-full py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm">Done</button>` : html`
+      <h3 className="font-bold text-slate-900 text-lg">${qr ? "Scan Bus QR Code" : "Tap Student ID Card"}</h3>
+      <p className="text-xs text-slate-500 mb-4">${qr ? "Point your camera at the MAE / Touch 'n Go QR displayed inside the bus." : "Hold your Student ID Card (Visa / Touch 'n Go) against the bus validator."}</p>
+      <div className="relative w-52 h-52 mx-auto rounded-2xl bg-slate-900 overflow-hidden flex items-center justify-center">
+        <div className="absolute inset-5 border-2 border-white/70 rounded-xl"></div>
+        <${Icon} n=${qr ? "qr-code" : "contact"} s=${64} c="text-white/25"/>
+        <div className="scan-line absolute left-5 right-5 h-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]"></div>
+      </div>
+      <button onClick=${() => setPhase("scanning")} disabled=${phase === "scanning"} className="mt-5 w-full py-3 rounded-xl bg-blue-600 text-white font-semibold text-sm disabled:opacity-60">${phase === "scanning" ? (qr ? "Scanning…" : "Reading card…") : (qr ? "Simulate Scan" : "Simulate Tap")}</button>
+      <button onClick=${onClose} className="mt-2 text-xs text-slate-400">Cancel</button>`}
+  <//>`;
+}
+
+
+/* UC-01 step 1: student sign-in (prototype only, no real auth) */
+const DEMO_USER = "Klust";
+const DEMO_PASS = "1234";
+
+function LoginScreen({ onLogin }) {
+  const [user, setUser] = useState("");
+  const [pass, setPass] = useState("");
+  const [show, setShow] = useState(false);
+  const [error, setError] = useState("");
+  const [note, setNote] = useState(false);
+
+  function submit(e) {
+    e.preventDefault();
+    if (user.trim().toLowerCase() === DEMO_USER.toLowerCase() && pass === DEMO_PASS) onLogin(DEMO_USER);
+    else setError("Incorrect username or password. Please try again.");
+  }
+
+  const field = "w-full flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-3 focus-within:border-blue-600 focus-within:bg-white transition";
+
+  return html`
+  <div className="flex-1 flex flex-col overflow-y-auto">
+    <div className="bg-gradient-to-br from-blue-600 to-indigo-700 text-white px-6 pt-14 pb-12 rounded-b-[2rem] text-center">
+      <div className="w-16 h-16 rounded-2xl bg-white/20 mx-auto flex items-center justify-center mb-3"><${Icon} n="bus" s=${34}/></div>
+      <h1 className="text-2xl font-extrabold tracking-tight">CampusShuttle</h1>
+      <p className="text-sm opacity-90 mt-1">Track. Reserve. Ride.</p>
+    </div>
+
+    <form onSubmit=${submit} className="px-6 pt-7 pb-6 flex-1 flex flex-col">
+      <h2 className="text-lg font-bold text-slate-900">Welcome back</h2>
+      <p className="text-xs text-slate-500 mb-5">Sign in with your student account to book a ride.</p>
+
+      <label className="text-xs font-semibold text-slate-600 mb-1">Username</label>
+      <div className=${field + " mb-4"}>
+        <${Icon} n="user" s=${18} c="text-slate-400"/>
+        <input value=${user} onInput=${e => { setUser(e.target.value); setError(""); }} autoComplete="username"
+          placeholder="Enter your username" className="flex-1 bg-transparent outline-none text-sm text-slate-900"/>
+      </div>
+
+      <label className="text-xs font-semibold text-slate-600 mb-1">Password</label>
+      <div className=${field}>
+        <${Icon} n="lock" s=${18} c="text-slate-400"/>
+        <input value=${pass} onInput=${e => { setPass(e.target.value); setError(""); }} type=${show ? "text" : "password"} autoComplete="current-password"
+          placeholder="Enter your password" className="flex-1 bg-transparent outline-none text-sm text-slate-900"/>
+        <button type="button" onClick=${() => setShow(!show)} className="text-slate-400"><${Icon} n=${show ? "eye-off" : "eye"} s=${18}/></button>
+      </div>
+
+      ${error && html`<p className="mt-3 text-xs text-rose-600 bg-rose-50 rounded-lg px-3 py-2 flex items-center gap-1.5"><${Icon} n="alert-circle" s=${14}/> ${error}</p>`}
+
+      <button type="submit" className="mt-6 w-full bg-slate-900 text-white rounded-2xl py-3.5 font-semibold shadow-lg">Log In</button>
+
+      <p className="text-center text-sm text-slate-500 mt-5">New student?
+        <button type="button" onClick=${() => setNote(true)} className="font-semibold text-blue-600 ml-1">Register</button>
+      </p>
+      ${note && html`<p className="mt-3 text-xs text-slate-500 bg-slate-100 rounded-lg px-3 py-2 text-center">Registration (FR-01) is documented but not simulated in this prototype.</p>`}
+
+      <p className="mt-auto pt-6 text-center text-[11px] text-slate-400">Demo account: ${DEMO_USER} / ${DEMO_PASS}</p>
+    </form>
+  </div>`;
+}
+
+
+/* Root component: owns state and wires sections together */
+function App({ user, onLogout }) {
+  const [start] = useState(() => performance.now());   // clock starts when the student logs in
+  const [now, setNow] = useState(start);
+  const [skip, setSkip] = useState(0);              // demo fast-forward (simulated minutes)
+  const [sel, setSel] = useState("A");
+  const [sheet, setSheet] = useState(null);         // null | "reserve" | "trips"
+  const [seats, setSeats] = useState(INITIAL_SEATS);
+  const [booking, setBooking] = useState(null);
+  const [history, setHistory] = useState([{ route: "C", bus: "SH-307", when: "Yesterday 16:20", status: "Completed" }]);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [pay, setPay] = useState("card");
+  const [scan, setScan] = useState(false);
+  const [paid, setPaid] = useState(false);           // ride payment done -> unlocks reward redemption
+  const [points, setPoints] = useState(380);
+  const [voucher, setVoucher] = useState(null);
+  const [toast, setToast] = useState("");
+
+  useEffect(() => {                                 // animation clock for the buses
+    let id; const loop = t => { setNow(t); id = requestAnimationFrame(loop); };
+    id = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  const simMin = Math.max(0, now - start) / SIM_MS + skip;   // simulated minutes since login
+  const eta = Math.round(bookingInfo(sel, simMin).left);       // live ETA = time to the scheduled bus
+  const flash = msg => { setToast(msg); setTimeout(() => setToast(""), 2600); };
+
+  /* Trip leaves the stop -> move it to history as Completed */
+  const departed = !!booking && simMin >= booking.departAt;
+  useEffect(() => {
+    if (!departed) return;
+    setHistory(h => [{ route: booking.route, bus: booking.bus, when: "Today " + fmtTime(booking.departAt), status: "Completed" }, ...h]);
+    setBooking(null); setConfirmCancel(false);
+    flash("Your bus has departed. Have a safe ride!");
+  }, [departed]);
+
+  function reserve() {
+    const bi = bookingInfo(sel, simMin);
+    if (seats[sel] < 1 || !bi.open) return;                   // policy: no booking within 5 min of departure
+    const bonus = sel === "C" ? OFF_PEAK_BONUS : 0;
+    setSeats({ ...seats, [sel]: seats[sel] - 1 });
+    setBooking({ route: sel, bus: ROUTES[sel].bus, seat: 30 - seats[sel] + 1, eta, departAt: bi.dep, bonus });
+    if (bonus) { setPoints(p => p + bonus); flash(`+${bonus} off-peak points earned!`); }
+  }
+  /* Cancellation policy: only allowed until 5 min before departure */
+  function cancelTrip() {
+    const b = booking;
+    if (!b || !cancelInfo(b, simMin).allowed) { setConfirmCancel(false); return; }
+    setSeats(s => ({ ...s, [b.route]: s[b.route] + 1 }));
+    if (b.bonus) setPoints(p => Math.max(0, p - b.bonus));      // off-peak bonus is returned
+    setHistory(h => [{ route: b.route, bus: b.bus, when: "Today " + fmtTime(b.departAt), status: "Cancelled" }, ...h]);
+    setBooking(null); setConfirmCancel(false);
+    flash("Trip cancelled · seat released");
+  }
+  function redeem() {
+    if (points < REDEEM_COST || !paid) return;      // redemption requires a completed payment
+    setPaid(false);
+    setPoints(p => p - REDEEM_COST);
+    setVoucher("CAFE-" + Math.random().toString(36).slice(2, 7).toUpperCase());
+  }
+
+  return html`
+  <${PhoneFrame}>
+      <div className="px-5 pt-5 pb-3 flex items-center justify-between bg-white">
+        <div><p className="text-xs text-slate-500">Hi, ${user} 👋 · ${fmtTime(simMin)} <button onClick=${() => setSkip(s => s + 2)} title="Demo: fast-forward 2 min" className="ml-1 text-[10px] font-semibold text-slate-500 bg-slate-100 rounded-full px-2 py-0.5">⏩ +2 min</button></p><h1 className="text-lg font-bold text-slate-900 leading-tight">Where to today?</h1></div>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 bg-amber-100 text-amber-700 rounded-full px-3 py-1.5 text-sm font-semibold"><${Icon} n="coins" s=${16}/>${points}</div>
+          <button onClick=${onLogout} title="Log out" className="w-9 h-9 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center"><${Icon} n="log-out" s=${16}/></button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto pb-24">
+        <${MapCard} sel=${sel} setSel=${setSel} simMin=${simMin} eta=${eta} seats=${seats}/>
+        <${PaymentCard} pay=${pay} setPay=${setPay} openScan=${() => setScan(true)} paid=${paid}/>
+        <${RewardsCard} points=${points} redeem=${redeem} paid=${paid}/>
+      </div>
+
+      ${!sheet && html`
+        <div className="absolute bottom-0 inset-x-0 p-4 bg-gradient-to-t from-slate-50 via-slate-50 to-transparent flex gap-2">
+          <button onClick=${() => setSheet("reserve")} className="flex-1 bg-slate-900 text-white rounded-2xl py-3.5 font-semibold flex items-center justify-center gap-2 shadow-lg">
+            <${Icon} n="armchair" s=${18}/> ${booking ? "View my reservation" : "Reserve a seat"}
+          </button>
+          <button onClick=${() => setSheet("trips")} className="bg-white text-slate-800 border border-slate-200 rounded-2xl px-4 font-semibold text-sm flex items-center gap-1.5 shadow-lg">
+            <${Icon} n="ticket" s=${16}/> My Trips
+          </button>
+        </div>`}
+
+      ${sheet === "reserve" && html`<${ReserveSheet} sel=${sel} setSel=${setSel} seats=${seats} eta=${eta} booking=${booking} pay=${pay} paid=${paid} simMin=${simMin}
+        reserve=${reserve} askCancel=${() => setConfirmCancel(true)} ff=${() => setSkip(s => s + 2)} openScan=${() => setScan(true)} close=${() => setSheet(null)}/>`}
+
+      ${sheet === "trips" && html`<${TripsSheet} booking=${booking} history=${history} simMin=${simMin}
+        askCancel=${() => setConfirmCancel(true)} ff=${() => setSkip(s => s + 2)} close=${() => setSheet(null)}/>`}
+
+      ${confirmCancel && booking && html`<${Modal} onClose=${() => setConfirmCancel(false)}>
+        <div className="w-14 h-14 rounded-full bg-rose-100 text-rose-600 mx-auto flex items-center justify-center mb-3"><${Icon} n="calendar-x" s=${28}/></div>
+        <h3 className="font-bold text-slate-900 text-lg">Cancel this trip?</h3>
+        <p className="text-xs text-slate-500 mt-1 mb-4">${ROUTES[booking.route].name} · ${booking.bus} · Seat #${booking.seat} · departs ${fmtTime(booking.departAt)}. Your seat will be released.</p>
+        <div className="flex gap-2">
+          <button onClick=${() => setConfirmCancel(false)} className="flex-1 py-3 rounded-xl border border-slate-200 text-slate-600 font-semibold text-sm">Keep trip</button>
+          <button onClick=${cancelTrip} className="flex-1 py-3 rounded-xl bg-rose-600 text-white font-semibold text-sm">Yes, cancel</button>
+        </div>
+      <//>`}
+
+      ${scan && html`<${ScanModal} bus=${booking ? booking.bus : ROUTES[sel].bus} mode=${pay} onPaid=${() => setPaid(true)} onClose=${() => setScan(false)}/>`}
+
+      ${voucher && html`<${Modal} onClose=${() => setVoucher(null)}>
+        <div className="w-14 h-14 rounded-full bg-amber-100 text-amber-600 mx-auto flex items-center justify-center mb-3"><${Icon} n="coffee" s=${28}/></div>
+        <h3 className="font-bold text-slate-900 text-lg">Voucher unlocked</h3>
+        <p className="text-xs text-slate-500 mb-3">Show this at Campus Cafe</p>
+        <div className="font-mono text-2xl font-bold tracking-widest bg-slate-50 border-2 border-dashed border-slate-300 rounded-xl py-3">${voucher}</div>
+        <button onClick=${() => setVoucher(null)} className="mt-4 w-full py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm">Done</button>
+      <//>`}
+
+      ${toast && html`<div className="absolute top-20 inset-x-0 z-40 flex justify-center"><div className="bg-emerald-600 text-white text-sm font-semibold px-4 py-2 rounded-full shadow-lg">${toast}</div></div>`}
+  <//>`;
+}
+
+/* Root: Login -> Student home */
+function Root() {
+  const [user, setUser] = useState(null);
+  if (!user) return html`<${PhoneFrame}><${LoginScreen} onLogin=${setUser}/><//>`;
+  return html`<${App} user=${user} onLogout=${() => setUser(null)}/>`;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(html`<${Root}/>`);
+
+</script>
+</body>
+</html>
